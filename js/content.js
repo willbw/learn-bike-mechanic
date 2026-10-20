@@ -734,3 +734,87 @@ const CHAPTERS = [
 
 const CHAPTER_BY_ID = Object.fromEntries(CHAPTERS.map(c => [c.id, c]));
 const DIRT_PARTS = CHAPTERS.filter(c => c.scene === 'dirtbike').flatMap(c => c.parts);
+
+/* ------------------------------------------------------------ GAME CONFIG */
+const BIKE_TRACK = (() => {
+  const base = profile([[0, 0], [40, 0], [70, 3], [90, 3], [110, 0], [190, 0], [250, 30], [268, 30], [322, 2], [335, 0],
+    [392, 0], [450, 32], [470, 32], [526, 0], [640, 0]]);
+  const height = x => base(x) + (x > 118 && x < 178 ? 0.5 * (1 - Math.cos(2 * Math.PI * (x - 118) / 6)) * 0.4 : 0);
+  const isMud = x => x > 337 && x < 388;
+  return {
+    height, startX: 4, finish: 565, box: [577, 593], end: 607, endMsg: 'Bump! Into the hay bales.',
+    ground: '#4a3726',
+    edge: x => isMud(x) ? '#2d1f14' : '#8a6a3f',
+    crr: x => isMud(x) ? 0.16 : 0.045,
+    decor(g, v) {
+      for (let x = 340; x < 387; x += 7) if (x > v.x0 && x < v.x1) {
+        g.fillStyle = 'rgba(30,20,12,.8)'; g.beginPath(); g.ellipse(v.SX(x), v.SY(height(x)) + 2, 0.9 * v.ppm, 0.08 * v.ppm, 0, 0, 7); g.fill();
+      }
+    },
+    signs: [
+      { x: 8, t: ['START', 'Enter = start engine'] },
+      { x: 112, t: ['WHOOPS', 'stand up, stay smooth'] },
+      { x: 182, t: ['STEEP HILL ↑', 'shift down: 2nd or 3rd'] },
+      { x: 266, t: ['DESCENT ↓', 'brake + engine braking'] },
+      { x: 333, t: ['MUD', 'steady throttle, keep it moving'] },
+      { x: 386, t: ['BIG CLIMB ↑', 'no run-up: 1st or 2nd!'] },
+      { x: 538, t: ['FINISH AHEAD', 'stop in the box for a bonus'] }
+    ]
+  };
+})();
+
+// Rider, drawn in bike svg units with the rear hub (235, 398) at the origin.
+function drawRiderBack(g) {
+  g.lineCap = 'round'; g.lineJoin = 'round';
+  g.strokeStyle = '#1e3a8a'; g.lineWidth = 34;
+  g.beginPath(); g.moveTo(213, -2); g.lineTo(270, -98); g.lineTo(185, -173); g.stroke();
+  g.strokeStyle = '#f5c518'; g.lineWidth = 46;
+  g.beginPath(); g.moveTo(185, -173); g.lineTo(245, -288); g.stroke();
+}
+function drawRiderFront(g) {
+  g.lineCap = 'round';
+  g.strokeStyle = '#f5c518'; g.lineWidth = 22;
+  g.beginPath(); g.moveTo(253, -278); g.lineTo(317, -248); g.lineTo(355, -298); g.stroke();
+  g.fillStyle = '#111'; g.beginPath(); g.arc(258, -336, 36, 0, 7); g.fill();
+  g.fillStyle = '#f5c518'; g.beginPath(); g.moveTo(278, -366); g.lineTo(320, -354); g.lineTo(288, -346); g.fill();
+  g.fillStyle = '#93c5fd'; g.fillRect(264, -342, 30, 14);
+  g.strokeStyle = '#111'; g.lineWidth = 26;
+  g.beginPath(); g.moveTo(213, -6); g.lineTo(235, -6); g.stroke();
+}
+
+const GAME = {
+  storeKey: 'pedals-to-pistons-v1',
+  title: 'Pedals to Pistons',
+  titleHTML: 'Pedals <span>to</span> Pistons',
+  lead: 'Learn how a motorcycle really works by building one. Start with a bicycle. Then, part by part, turn it into a four-stroke dirt bike: suspension, engine, fuel, spark, cooling, clutch, and gearbox. Then ride it.',
+  points: [
+    '<b>9 chapters</b>, each adding one system',
+    '<b>40+ parts</b>, each with a workshop card explaining how it works',
+    '<b>7 interactive labs</b>: gears, suspension, a four-stroke engine, carb jetting, ignition timing, cooling, clutch',
+    'A <b>physics-based ride</b> where you can stall, lug, and slip the clutch for real'
+  ],
+  other: { text: 'Prefer four wheels?', label: 'Try Soapbox to Sports Car', href: 'car.html' },
+  heroScene: 'dirtbike',
+  scenes: { bicycle: { viewBox: '70 50 860 490' }, dirtbike: { viewBox: '70 50 860 490' } },
+  ride: {
+    verb: 'Ride', physics: BIKE, track: BIKE_TRACK, cylinders: 1, lugRpm: 3500,
+    hud: { maxRpm: 13000, band: [6000, 11000] },
+    vehicle: {
+      bodyIds: DIRT_PARTS.filter(id => id !== 'm_rear_wheel' && id !== 'm_front_wheel'),
+      rear: [235, 398], wheelbaseSvg: 533, wheelbase: 1.48, noseM: 1.74, exhaust: [220, 208],
+      wheels: [{ id: 'm_rear_wheel', cx: 235, cy: 398, r: 125 }, { id: 'm_front_wheel', cx: 768, cy: 390, r: 133 }],
+      drawBack: drawRiderBack, drawFront: drawRiderFront
+    },
+    words: {
+      startMsg: 'Press Enter (or START) to fire up the engine.',
+      clutchIn: 'Pull the clutch', firstGear: 'Hold the clutch (Space) and press Q for 1st gear.',
+      neutralHint: 'Neutral (N): it sits between 1st and 2nd',
+      keys: '<kbd>Enter</kbd> start · <kbd>Space</kbd> clutch · <kbd>W</kbd> throttle · <kbd>S</kbd> brake · <kbd>Q</kbd>/<kbd>E</kbd> shift down/up · <kbd>K</kbd> kill'
+    },
+    gold: 55, silver: 90,
+    certTitle: 'Dirt-bike mechanic',
+    certText: 'You built a dirt bike from a bicycle up, learned what every part does, and rode it across the test track.',
+    goldText: 'Gold: clean and quick, a real rider.',
+    tip: 'Tip: shift down before the climbs, and keep some throttle on as the clutch comes out.'
+  }
+};

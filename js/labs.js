@@ -194,6 +194,184 @@ const LAB_GEARS = {
 };
 
 /* ============================================ LAB: SUSPENSION + BRAKES */
+function twoPanels(root, subtitle) {
+  root.innerHTML = `<div class="lab-grid"><div class="lab-stage"></div><div class="lab-side"><div class="lab-controls"></div></div></div>
+    <h3 class="lab-sub">${subtitle}</h3>
+    <div class="lab-grid"><div class="lab-stage b"></div><div class="lab-side"><div class="lab-controls b"></div></div></div>`;
+  return {
+    stage: root.querySelector('.lab-stage'), ctl: root.querySelector('.lab-controls'),
+    stageB: root.querySelector('.lab-stage.b'), ctlB: root.querySelector('.lab-controls.b')
+  };
+}
+
+/* Quarter-vehicle model: a sprung mass on a spring + damper over a wheel and tyre.
+   cfg: P {ms, mu, kt, ct, L0, travel, R}, k/c/speed: [min, max, step, default],
+   terrains: [{v, t, road(x), drop}], terrain (default), massLabel, ppm,
+   check(s, contact, ctx) to tick tasks. */
+function suspensionPanel(stage, ctl, ctx, cfg) {
+  const cv = makeCanvas(stage, 760, 330);
+  const P = cfg.P, TR = Object.fromEntries(cfg.terrains.map(t => [t.v, t]));
+  const s = { k: cfg.k[3], c: cfg.c[3], speed: cfg.speed[3], sc: cfg.terrain, x: 0, scT: 0, hist: [], contactHist: [], bottoms: 0, wasB: false, maxc: 0 };
+  const roadAt = x => TR[s.sc].road(x);
+  const travelMm = Math.round(P.travel * 1000);
+  function resetSim() {
+    const g = 9.81, drop = TR[s.sc].drop || 0;
+    s.zu = P.R - (P.ms + P.mu) * g / P.kt + drop; s.vu = 0; s.zs = s.zu + P.L0 - P.ms * g / s.k; s.vs = 0;
+    s.x = 0; s.scT = 0; s.bottoms = 0; s.maxc = 0; s.hist = []; s.contactHist = []; s.wasB = false;
+  }
+  resetSim();
+  const ro = readouts([['sag', 'Static sag'], ['used', 'Max travel used'], ['bot', 'Bottom-outs'], ['con', 'Tyre contact']]);
+  const btnRun = el(`<button class="btn small" type="button">↺ Replay</button>`);
+  btnRun.onclick = resetSim;
+  ctl.append(
+    choice('Terrain', cfg.terrains.map(t => ({ v: t.v, t: t.t })), s.sc, v => { s.sc = v; resetSim(); }),
+    slider('Spring rate', cfg.k[0], cfg.k[1], cfg.k[2], s.k, v => (v / 1000).toFixed(1) + ' N/mm', v => { s.k = v; }),
+    slider('Damping', cfg.c[0], cfg.c[1], cfg.c[2], s.c, v => v + ' Ns/m', v => { s.c = v; }),
+    slider('Speed', cfg.speed[0], cfg.speed[1], cfg.speed[2], s.speed, v => v + ' m/s', v => { s.speed = v; }),
+    ro, btnRun
+  );
+  function physStep(dt) {
+    const g = 9.81;
+    s.x += s.speed * dt;
+    const r = roadAt(s.x), rd = (roadAt(s.x + 0.001) - r) / 0.001 * s.speed;
+    const d = r + P.R - s.zu;
+    let Ft = 0; if (d > 0) { Ft = Math.max(0, P.kt * d + P.ct * (rd - s.vu)); }
+    const comp = P.L0 - (s.zs - s.zu), compv = -(s.vs - s.vu);
+    // Top-out stop, a progressive bump rubber in the last 10% of travel, then a hard stop.
+    let Fs = s.k * comp; if (comp < 0) Fs = 200000 * comp;
+    const cush = P.travel * 0.1;
+    if (comp > P.travel - cush) Fs += (P.cushK || 60000) * (comp - (P.travel - cush));
+    if (comp > P.travel) Fs += 1e6 * (comp - P.travel);
+    const F = Fs + s.c * compv;
+    s.vs += (F - P.ms * g) / P.ms * dt; s.vu += (Ft - F - P.mu * g) / P.mu * dt;
+    s.zs += s.vs * dt; s.zu += s.vu * dt;
+    const isB = comp > P.travel - 0.005; if (isB && !s.wasB) s.bottoms++; s.wasB = isB;
+    s.maxc = Math.max(s.maxc, comp);
+    return { comp, contact: Ft > 0 };
+  }
+  let acc = 0;
+  return animLoop(dt => {
+    const sub = 40, h = dt / sub; let last, cn = 0;
+    for (let i = 0; i < sub; i++) { last = physStep(h); if (last.contact) cn++; }
+    s.scT += dt;
+    s.contactHist.push(cn / sub); if (s.contactHist.length > 180) s.contactHist.shift();
+    acc += dt; if (acc > 1 / 60) { acc = 0; s.hist.push(last.comp); if (s.hist.length > 300) s.hist.shift(); }
+    if (TR[s.sc].drop && s.scT > 3) resetSim();
+    const contact = s.contactHist.reduce((a, b) => a + b, 0) / Math.max(1, s.contactHist.length) * 100;
+    ro.set('sag', (P.ms * 9.81 / s.k * 1000).toFixed(0) + ' mm');
+    ro.set('used', (s.maxc * 1000).toFixed(0) + ` / ${travelMm} mm`);
+    ro.set('bot', s.bottoms);
+    ro.set('con', contact.toFixed(0) + '%');
+    cfg.check(s, contact, ctx);
+
+    const g = cv.g; gridBg(g, cv.w, cv.h);
+    const ppm = cfg.ppm || 190, gx = 240;
+    s.cam = lerp(s.cam || 0, Math.max(0, s.zu - P.R - 0.05), 0.15);
+    const gy = 300 + s.cam * ppm;
+    const toY = z => gy - z * ppm;
+    g.beginPath(); g.moveTo(0, cv.h);
+    for (let px = 0; px <= cv.w; px += 3) { const wx = s.x + (px - gx) / ppm; g.lineTo(px, toY(roadAt(wx))); }
+    g.lineTo(cv.w, cv.h); g.closePath(); g.fillStyle = cfg.groundFill || '#5b4632'; g.fill();
+    g.strokeStyle = cfg.groundEdge || '#8b6d4c'; g.lineWidth = 3; g.beginPath();
+    for (let px = 0; px <= cv.w; px += 3) { const wx = s.x + (px - gx) / ppm; px ? g.lineTo(px, toY(roadAt(wx))) : g.moveTo(px, toY(roadAt(wx))); }
+    g.stroke();
+    const wy = toY(s.zu), wr = P.R * ppm;
+    g.beginPath(); g.arc(gx, wy, wr - 10, 0, Math.PI * 2); g.strokeStyle = '#17191c'; g.lineWidth = 20; g.stroke();
+    g.save(); g.translate(gx, wy); g.rotate(s.x / P.R);
+    g.strokeStyle = 'rgba(200,210,220,.4)'; g.lineWidth = 1.2;
+    for (let i = 0; i < 12; i++) { const a = i / 12 * Math.PI * 2; g.beginPath(); g.moveTo(0, 0); g.lineTo(Math.cos(a) * (wr - 22), Math.sin(a) * (wr - 22)); g.stroke(); }
+    g.restore();
+    g.beginPath(); g.arc(gx, wy, 10, 0, Math.PI * 2); g.fillStyle = C.steel; g.fill();
+    const cyy = toY(s.zs);
+    g.fillStyle = C.blue; roundRect(g, gx - 90, cyy - 40, 180, 40, 8); g.fill();
+    label(g, cfg.massLabel, gx, cyy - 20, '#0b1220', 12, 'center', 700);
+    const top = cyy, bot = wy - 12;
+    g.strokeStyle = '#e5482f'; g.lineWidth = 4; g.beginPath();
+    const n = 10; g.moveTo(gx - 26, top);
+    for (let i = 1; i < n * 2; i++) { const t = i / (n * 2); g.lineTo(gx - 26 + (i % 2 ? 12 : -12), top + (bot - top) * t); }
+    g.lineTo(gx - 26, bot); g.stroke();
+    g.fillStyle = C.amber; g.fillRect(gx + 16, top, 18, (bot - top) * 0.55);
+    g.strokeStyle = C.steel; g.lineWidth = 5; g.beginPath(); g.moveTo(gx + 25, top + (bot - top) * 0.5); g.lineTo(gx + 25, bot); g.stroke();
+    g.strokeStyle = '#59616b'; g.lineWidth = 6; g.beginPath(); g.moveTo(gx - 40, bot); g.lineTo(gx + 40, bot); g.lineTo(gx, wy); g.closePath(); g.stroke();
+    label(g, 'spring', gx - 58, (top + bot) / 2, '#e5482f', 12);
+    label(g, 'damper', gx + 66, (top + bot) / 2, C.amber, 12);
+    const ox = 470, oy = 30, ow = 270, oh = 130;
+    g.fillStyle = 'rgba(10,16,24,.85)'; roundRect(g, ox, oy, ow, oh, 8); g.fill();
+    g.strokeStyle = C.red; g.setLineDash([4, 3]); g.beginPath(); g.moveTo(ox, oy + 12); g.lineTo(ox + ow, oy + 12); g.stroke(); g.setLineDash([]);
+    label(g, `bottom (${travelMm} mm)`, ox + ow - 6, oy + 22, C.red, 10, 'right');
+    g.strokeStyle = C.teal; g.lineWidth = 2; g.beginPath();
+    s.hist.forEach((v, i) => { const px = ox + i / 300 * ow, py = oy + oh - 8 - clamp(v / P.travel, -0.05, 1.05) * (oh - 20); i ? g.lineTo(px, py) : g.moveTo(px, py); });
+    g.stroke();
+    label(g, 'suspension compression', ox + 8, oy + oh - 10, C.dim, 10, 'left');
+    if (last && !last.contact) label(g, 'AIRBORNE / NO GRIP', gx, Math.min(cv.h - 14, gy + 16), C.red, 14, 'center', 700);
+  });
+}
+
+/* Hydraulic brake calculator. cfg: forceLabel, F/dm/dc/rotor: [min, max, step, default],
+   ratio (lever or pedal), servo (assist factor or 0), pistons per caliper, calipers
+   (on the braked axle), circuitCalipers (for travel), share (fraction of braking this
+   axle does), mass, tyreR, mu, maxTravel, travelBase, overTravel, check(r, ctx). */
+function brakePanel(stage, ctl, ctx, cfg) {
+  const cb = makeCanvas(stage, 760, 200);
+  const b = { F: cfg.F[3], dm: cfg.dm[3], dc: cfg.dc[3], rotor: cfg.rotor[3], servo: !!cfg.servo };
+  const roB = readouts([['p', 'Line pressure'], ['mult', 'Hydraulic multiplication'], ['clamp', 'Pad clamp force'], ['dec', 'Deceleration'], ['trav', cfg.travelLabel]]);
+  ctl.append(slider(cfg.forceLabel, cfg.F[0], cfg.F[1], cfg.F[2], b.F, v => v + ' N', v => b.F = v));
+  if (cfg.servo) ctl.append(toggle(`Brake servo (×${cfg.servo} assist)`, true, v => b.servo = v));
+  ctl.append(
+    slider('Master cylinder bore', cfg.dm[0], cfg.dm[1], cfg.dm[2], b.dm, v => v + ' mm', v => b.dm = v),
+    slider(cfg.pistonLabel, cfg.dc[0], cfg.dc[1], cfg.dc[2], b.dc, v => v + ' mm', v => b.dc = v),
+    slider('Rotor diameter', cfg.rotor[0], cfg.rotor[1], cfg.rotor[2], b.rotor, v => v + ' mm', v => b.rotor = v),
+    roB
+  );
+  return animLoop(() => {
+    const Am = Math.PI / 4 * b.dm * b.dm, Ac = cfg.pistons * Math.PI / 4 * b.dc * b.dc;
+    const push = b.F * cfg.ratio * (b.servo && cfg.servo ? cfg.servo : 1);
+    const p = push / Am;                      // N/mm^2 = MPa
+    const clampF = p * Ac;                    // N
+    const fric = cfg.mu * clampF * 2;         // two pad faces
+    const torque = cfg.calipers * fric * (b.rotor / 2 - 15) / 1000;
+    const decel = torque / cfg.tyreR / cfg.share / cfg.mass / 9.81;
+    const travel = 0.3 * (Ac * cfg.circuitCalipers / Am) * cfg.ratio + cfg.travelBase;
+    const bottomed = travel > cfg.maxTravel;
+    const effDec = bottomed ? decel * cfg.maxTravel / travel * 0.6 : decel;
+    roB.set('p', (p * 10).toFixed(1) + ' bar');
+    roB.set('mult', '×' + (Ac / Am).toFixed(1));
+    roB.set('clamp', (clampF / 1000).toFixed(2) + ' kN');
+    roB.set('dec', effDec.toFixed(2) + ' g' + (effDec > 1.0 ? ' (wheels lock!)' : ''));
+    roB.set('trav', travel.toFixed(0) + ' mm' + (bottomed ? ` (${cfg.overTravel})` : ''));
+    cfg.check({ F: b.F, decel: effDec, bottomed, servo: b.servo }, ctx);
+    const g = cb.g; gridBg(g, cb.w, cb.h);
+    g.strokeStyle = C.steel; g.lineWidth = 8; g.lineCap = 'round';
+    g.beginPath(); g.moveTo(40, 60); g.lineTo(140, 60 + Math.min(travel, 40) * 0.6); g.stroke();
+    label(g, `${b.F} N`, 90, 30, C.amber, 14, 'center', 700);
+    if (cfg.servo) label(g, b.servo ? `servo ×${cfg.servo}` : 'no servo', 90, 110, b.servo ? C.teal : C.red, 11, 'center', 700);
+    const mh = b.dm * 2.4 * (cfg.drawScale || 1);
+    g.fillStyle = '#3b4450'; roundRect(g, 150, 80 - mh / 2 - 4, 80, mh + 8, 4); g.fill();
+    g.fillStyle = C.red; g.fillRect(156, 80 - mh / 2, 66, mh);
+    g.fillStyle = C.steel; g.fillRect(150, 80 - mh / 2, 18, mh);
+    label(g, 'master cyl.', 190, 80 + mh / 2 + 16, C.dim, 11);
+    g.strokeStyle = C.red; g.lineWidth = 6; g.beginPath(); g.moveTo(230, 80); g.bezierCurveTo(330, 80, 380, 150, 470, 120); g.stroke();
+    label(g, `${(p * 10).toFixed(0)} bar everywhere`, 360, 90, C.text, 12);
+    const rr = b.rotor / 4;
+    g.beginPath(); g.arc(640, 100, rr, 0, Math.PI * 2); g.strokeStyle = '#9aa4ae'; g.lineWidth = 12; g.stroke();
+    const ch = b.dc * 2.4 * (cfg.drawScale || 1);
+    g.fillStyle = '#c53030'; roundRect(g, 640 - rr - 70, 100 - ch / 2 - 8, 50, ch + 16, 6); g.fill();
+    g.fillStyle = C.steel; g.fillRect(640 - rr - 62, 100 - ch / 2, 34, ch);
+    g.strokeStyle = C.red; g.lineWidth = 6; g.beginPath(); g.moveTo(470, 120); g.lineTo(640 - rr - 70, 110); g.stroke();
+    g.fillStyle = '#e8b04a'; g.fillRect(640 - rr - 20, 100 - ch / 2, 8, ch);
+    label(g, 'caliper piston' + (cfg.pistons > 1 ? 's' : ''), 640 - rr - 45, 100 + ch / 2 + 22, C.dim, 11);
+    label(g, 'rotor', 640, 100 + rr + 20, C.dim, 11);
+    label(g, `${(clampF / 1000).toFixed(1)} kN`, 640 - rr - 45, 100 - ch / 2 - 22, C.amber, 14, 'center', 700);
+    const mx = 740, f = clamp(effDec / 1.2, 0, 1);
+    g.fillStyle = '#1b2733'; g.fillRect(mx - 8, 20, 16, 160);
+    g.fillStyle = effDec > 1 ? C.red : effDec >= 0.9 ? C.green : C.amber;
+    g.fillRect(mx - 8, 20 + 160 * (1 - f), 16, 160 * f);
+    g.strokeStyle = C.text; g.lineWidth = 1;
+    [0.9, 1.0].forEach(v => { const y = 20 + 160 * (1 - v / 1.2); g.beginPath(); g.moveTo(mx - 12, y); g.lineTo(mx + 12, y); g.stroke(); });
+    label(g, 'g', mx, 192, C.dim, 11);
+  });
+}
+
 const LAB_CHASSIS = {
   title: 'Suspension & Brakes Lab',
   intro: 'Tune the spring and damper on a quarter-bike model, then design a hydraulic front brake.',
@@ -204,181 +382,30 @@ const LAB_CHASSIS = {
     { id: 'brake', text: 'Brake design: <b>0.9–1.0 g</b> with only <b>100 N</b> at the lever, without the lever hitting the bar' }
   ],
   mount(root, ctx) {
-    root.innerHTML = `<div class="lab-grid"><div class="lab-stage"></div><div class="lab-side"><div class="lab-controls"></div></div></div>
-      <h3 class="lab-sub">Hydraulic brake designer</h3>
-      <div class="lab-grid"><div class="lab-stage b"></div><div class="lab-side"><div class="lab-controls b"></div></div></div>`;
-    const stage = root.querySelector('.lab-stage'), ctl = root.querySelector('.lab-controls');
-    const stageB = root.querySelector('.lab-stage.b'), ctlB = root.querySelector('.lab-controls.b');
-    const cv = makeCanvas(stage, 760, 330);
-    const P = { ms: 120, mu: 15, kt: 150000, ct: 200, L0: 0.6, travel: 0.30, R: 0.33 };
-    const s = { k: 12000, c: 1200, speed: 8, sc: 'rock', x: 0, t: 0, scT: 0, hist: [], contactHist: [], bottoms: 0, wasB: false, maxc: 0 };
-    function roadAt(x) {
-      if (s.sc === 'chatter') return 0.02 * Math.abs(Math.sin(Math.PI * x / 0.7));
-      if (s.sc === 'rock') { const p = ((x % 14) + 14) % 14; return (p > 4 && p < 5.2) ? 0.22 * Math.sin(Math.PI * (p - 4) / 1.2) : 0; }
-      return 0;
-    }
-    function resetSim() {
-      const g = 9.81;
-      s.zu = P.R - (P.ms + P.mu) * g / P.kt; s.vu = 0; s.zs = s.zu + P.L0 - P.ms * g / s.k; s.vs = 0;
-      if (s.sc === 'jump') { s.zu += 1.2; s.zs += 1.2; }
-      s.x = 0; s.scT = 0; s.bottoms = 0; s.maxc = 0; s.hist = []; s.contactHist = []; s.wasB = false;
-    }
-    resetSim();
-    const ro = readouts([['sag', 'Static sag'], ['used', 'Max travel used'], ['bot', 'Bottom-outs'], ['con', 'Tyre contact']]);
-    const btnRun = el(`<button class="btn small" type="button">↺ Replay</button>`);
-    btnRun.onclick = resetSim;
-    ctl.append(
-      choice('Terrain', [{ v: 'chatter', t: 'Chatter bumps' }, { v: 'rock', t: 'Big rock' }, { v: 'jump', t: 'Jump landing' }], s.sc, v => { s.sc = v; resetSim(); }),
-      slider('Spring rate', 5000, 30000, 500, s.k, v => (v / 1000).toFixed(1) + ' N/mm', v => { s.k = v; }),
-      slider('Damping', 0, 6000, 100, s.c, v => v + ' Ns/m', v => { s.c = v; }),
-      slider('Speed', 2, 20, 1, s.speed, v => v + ' m/s', v => { s.speed = v; }),
-      ro, btnRun
-    );
-    function physStep(dt) {
-      const g = 9.81;
-      s.x += s.speed * dt;
-      const r = roadAt(s.x), rd = (roadAt(s.x + 0.001) - r) / 0.001 * s.speed;
-      const d = r + P.R - s.zu;
-      let Ft = 0; if (d > 0) { Ft = Math.max(0, P.kt * d + P.ct * (rd - s.vu)); }
-      const comp = P.L0 - (s.zs - s.zu), compv = -(s.vs - s.vu);
-      let Fs = s.k * comp; if (comp < 0) Fs = 200000 * comp;
-      if (comp > P.travel - 0.03) Fs += 60000 * (comp - (P.travel - 0.03));
-      if (comp > P.travel) Fs += 1e6 * (comp - P.travel);
-      const F = Fs + s.c * compv;
-      s.vs += (F - P.ms * g) / P.ms * dt; s.vu += (Ft - F - P.mu * g) / P.mu * dt;
-      s.zs += s.vs * dt; s.zu += s.vu * dt;
-      const isB = comp > P.travel - 0.005; if (isB && !s.wasB) s.bottoms++; s.wasB = isB;
-      s.maxc = Math.max(s.maxc, comp);
-      return { comp, contact: Ft > 0 };
-    }
-    let acc = 0, hcount = 0;
-    const stop = animLoop(dt => {
-      const sub = 40, h = dt / sub; let last;
-      let cn = 0;
-      for (let i = 0; i < sub; i++) { last = physStep(h); if (last.contact) cn++; }
-      s.scT += dt;
-      s.contactHist.push(cn / sub); if (s.contactHist.length > 180) s.contactHist.shift();
-      acc += dt; if (acc > 1 / 60) { acc = 0; s.hist.push(last.comp); if (s.hist.length > 300) s.hist.shift(); }
-      if (s.sc === 'jump' && s.scT > 3) resetSim();
-      const contact = s.contactHist.reduce((a, b) => a + b, 0) / Math.max(1, s.contactHist.length) * 100;
-      ro.set('sag', (P.ms * 9.81 / s.k * 1000).toFixed(0) + ' mm');
-      ro.set('used', (s.maxc * 1000).toFixed(0) + ' / 300 mm');
-      ro.set('bot', s.bottoms);
-      ro.set('con', contact.toFixed(0) + '%');
-      if (s.sc === 'rock' && s.c <= 200 && s.scT > 4) ctx.complete('pogo');
-      if (s.sc === 'jump' && s.scT > 1.6 && s.bottoms === 0 && s.maxc > 0.1) ctx.complete('jump');
-      if (s.sc === 'chatter' && s.c >= 5000 && s.contactHist.length >= 120 && contact < 90) ctx.complete('harsh');
-
-      // draw
-      const g = cv.g; gridBg(g, cv.w, cv.h);
-      const ppm = 190, gx = 240;
-      s.cam = lerp(s.cam || 0, Math.max(0, s.zu - P.R - 0.05), 0.15);
-      const gy = 300 + s.cam * ppm;
-      const toY = z => gy - z * ppm;
-      // road
-      g.beginPath(); g.moveTo(0, cv.h);
-      for (let px = 0; px <= cv.w; px += 3) { const wx = s.x + (px - gx) / ppm; g.lineTo(px, toY(roadAt(wx))); }
-      g.lineTo(cv.w, cv.h); g.closePath(); g.fillStyle = '#5b4632'; g.fill();
-      g.strokeStyle = '#8b6d4c'; g.lineWidth = 3; g.beginPath();
-      for (let px = 0; px <= cv.w; px += 3) { const wx = s.x + (px - gx) / ppm; px ? g.lineTo(px, toY(roadAt(wx))) : g.moveTo(px, toY(roadAt(wx))); }
-      g.stroke();
-      // wheel
-      const wy = toY(s.zu), wr = P.R * ppm;
-      g.beginPath(); g.arc(gx, wy, wr - 10, 0, Math.PI * 2); g.strokeStyle = '#17191c'; g.lineWidth = 20; g.stroke();
-      g.save(); g.translate(gx, wy); g.rotate(s.x / P.R);
-      g.strokeStyle = 'rgba(200,210,220,.4)'; g.lineWidth = 1.2;
-      for (let i = 0; i < 12; i++) { const a = i / 12 * Math.PI * 2; g.beginPath(); g.moveTo(0, 0); g.lineTo(Math.cos(a) * (wr - 22), Math.sin(a) * (wr - 22)); g.stroke(); }
-      g.restore();
-      g.beginPath(); g.arc(gx, wy, 10, 0, Math.PI * 2); g.fillStyle = C.steel; g.fill();
-      // chassis
-      const cyy = toY(s.zs);
-      g.fillStyle = C.blue; roundRect(g, gx - 90, cyy - 40, 180, 40, 8); g.fill();
-      label(g, 'sprung mass (bike + rider)', gx, cyy - 20, '#0b1220', 12, 'center', 700);
-      // spring + damper
-      const top = cyy, bot = wy - 12;
-      g.strokeStyle = '#e5482f'; g.lineWidth = 4; g.beginPath();
-      const n = 10; g.moveTo(gx - 26, top);
-      for (let i = 1; i < n * 2; i++) { const t = i / (n * 2); g.lineTo(gx - 26 + (i % 2 ? 12 : -12), top + (bot - top) * t); }
-      g.lineTo(gx - 26, bot); g.stroke();
-      g.fillStyle = C.amber; g.fillRect(gx + 16, top, 18, (bot - top) * 0.55);
-      g.strokeStyle = C.steel; g.lineWidth = 5; g.beginPath(); g.moveTo(gx + 25, top + (bot - top) * 0.5); g.lineTo(gx + 25, bot); g.stroke();
-      g.strokeStyle = '#59616b'; g.lineWidth = 6; g.beginPath(); g.moveTo(gx - 40, bot); g.lineTo(gx + 40, bot); g.lineTo(gx, wy); g.closePath(); g.stroke();
-      label(g, 'spring', gx - 58, (top + bot) / 2, '#e5482f', 12);
-      label(g, 'damper', gx + 66, (top + bot) / 2, C.amber, 12);
-      // compression graph
-      const ox = 470, oy = 30, ow = 270, oh = 130;
-      g.fillStyle = 'rgba(10,16,24,.85)'; roundRect(g, ox, oy, ow, oh, 8); g.fill();
-      g.strokeStyle = C.red; g.setLineDash([4, 3]); g.beginPath(); g.moveTo(ox, oy + 12); g.lineTo(ox + ow, oy + 12); g.stroke(); g.setLineDash([]);
-      label(g, 'bottom (300 mm)', ox + ow - 6, oy + 22, C.red, 10, 'right');
-      g.strokeStyle = C.teal; g.lineWidth = 2; g.beginPath();
-      s.hist.forEach((v, i) => { const px = ox + i / 300 * ow, py = oy + oh - 8 - clamp(v / 0.3, -0.05, 1.05) * (oh - 20); i ? g.lineTo(px, py) : g.moveTo(px, py); });
-      g.stroke();
-      label(g, 'suspension compression', ox + 8, oy + oh - 10, C.dim, 10, 'left');
-      if (last && !last.contact) label(g, 'AIRBORNE / NO GRIP', gx, Math.min(cv.h - 14, gy + 16), C.red, 14, 'center', 700);
+    const L = twoPanels(root, 'Hydraulic brake designer');
+    const a = suspensionPanel(L.stage, L.ctl, ctx, {
+      P: { ms: 120, mu: 15, kt: 150000, ct: 200, L0: 0.6, travel: 0.30, R: 0.33 },
+      k: [5000, 30000, 500, 12000], c: [0, 6000, 100, 1200], speed: [2, 20, 1, 8],
+      massLabel: 'sprung mass (bike + rider)', terrain: 'rock',
+      terrains: [
+        { v: 'chatter', t: 'Chatter bumps', road: x => 0.02 * Math.abs(Math.sin(Math.PI * x / 0.7)) },
+        { v: 'rock', t: 'Big rock', road: x => { const p = ((x % 14) + 14) % 14; return (p > 4 && p < 5.2) ? 0.22 * Math.sin(Math.PI * (p - 4) / 1.2) : 0; } },
+        { v: 'jump', t: 'Jump landing', road: () => 0, drop: 1.2 }
+      ],
+      check(s, contact, ctx) {
+        if (s.sc === 'rock' && s.c <= 200 && s.scT > 4) ctx.complete('pogo');
+        if (s.sc === 'jump' && s.scT > 1.6 && s.bottoms === 0 && s.maxc > 0.1) ctx.complete('jump');
+        if (s.sc === 'chatter' && s.c >= 5000 && s.contactHist.length >= 120 && contact < 90) ctx.complete('harsh');
+      }
     });
-
-    /* ---------- brake designer ---------- */
-    const cb = makeCanvas(stageB, 760, 200);
-    const b = { F: 100, lever: 5, dm: 11, dc: 27, rotor: 260 };
-    const roB = readouts([['p', 'Line pressure'], ['mult', 'Hydraulic multiplication'], ['clamp', 'Pad clamp force'], ['dec', 'Deceleration'], ['trav', 'Lever travel']]);
-    ctlB.append(
-      slider('Lever force', 20, 200, 5, b.F, v => v + ' N', v => b.F = v),
-      slider('Master cylinder bore', 8, 14, 0.5, b.dm, v => v + ' mm', v => b.dm = v),
-      slider('Caliper pistons (2×)', 22, 34, 1, b.dc, v => v + ' mm', v => b.dc = v),
-      slider('Rotor diameter', 220, 320, 10, b.rotor, v => v + ' mm', v => b.rotor = v),
-      roB
-    );
-    const stopB = animLoop(() => {
-      const Am = Math.PI / 4 * b.dm * b.dm, Ac = 2 * Math.PI / 4 * b.dc * b.dc;
-      const p = b.F * b.lever / Am;           // N/mm^2 = MPa
-      const clampF = p * Ac;                  // N
-      const fric = 0.45 * clampF * 2;
-      const torque = fric * (b.rotor / 2 - 15) / 1000;
-      const decel = torque / 0.36 / 260 / 9.81;
-      const travel = 0.3 * (Ac / Am) * b.lever + 5;
-      const bottomed = travel > 35;
-      const effDec = bottomed ? decel * 35 / travel * 0.6 : decel;
-      roB.set('p', (p * 10).toFixed(1) + ' bar');
-      roB.set('mult', '×' + (Ac / Am).toFixed(1));
-      roB.set('clamp', (clampF / 1000).toFixed(2) + ' kN');
-      roB.set('dec', effDec.toFixed(2) + ' g' + (effDec > 1.0 ? ' (front locks!)' : ''));
-      roB.set('trav', travel.toFixed(0) + ' mm' + (bottomed ? ' (hits bar!)' : ''));
-      if (b.F <= 100 && effDec >= 0.9 && effDec <= 1.0 && !bottomed) ctx.complete('brake');
-      const g = cb.g; gridBg(g, cb.w, cb.h);
-      // lever
-      g.strokeStyle = C.steel; g.lineWidth = 8; g.lineCap = 'round';
-      g.beginPath(); g.moveTo(40, 60); g.lineTo(140, 60 + Math.min(travel, 40) * 0.6); g.stroke();
-      label(g, `${b.F} N`, 90, 30, C.amber, 14, 'center', 700);
-      // master cylinder
-      const mh = b.dm * 2.4;
-      g.fillStyle = '#3b4450'; roundRect(g, 150, 80 - mh / 2 - 4, 80, mh + 8, 4); g.fill();
-      g.fillStyle = C.red; g.fillRect(156, 80 - mh / 2, 66, mh);
-      g.fillStyle = C.steel; g.fillRect(150, 80 - mh / 2, 18, mh);
-      label(g, 'master cyl.', 190, 80 + mh / 2 + 16, C.dim, 11);
-      // hose
-      g.strokeStyle = C.red; g.lineWidth = 6; g.beginPath(); g.moveTo(230, 80); g.bezierCurveTo(330, 80, 380, 150, 470, 120); g.stroke();
-      label(g, `${(p * 10).toFixed(0)} bar everywhere`, 360, 90, C.text, 12);
-      // caliper + rotor
-      const rr = b.rotor / 4;
-      g.beginPath(); g.arc(640, 100, rr, 0, Math.PI * 2); g.strokeStyle = '#9aa4ae'; g.lineWidth = 12; g.stroke();
-      const ch = b.dc * 2.4;
-      g.fillStyle = '#c53030'; roundRect(g, 640 - rr - 70, 100 - ch / 2 - 8, 50, ch + 16, 6); g.fill();
-      g.fillStyle = C.steel; g.fillRect(640 - rr - 62, 100 - ch / 2, 34, ch);
-      g.strokeStyle = C.red; g.lineWidth = 6; g.beginPath(); g.moveTo(470, 120); g.lineTo(640 - rr - 70, 110); g.stroke();
-      g.fillStyle = '#e8b04a'; g.fillRect(640 - rr - 20, 100 - ch / 2, 8, ch);
-      label(g, 'caliper pistons', 640 - rr - 45, 100 + ch / 2 + 22, C.dim, 11);
-      label(g, 'rotor', 640, 100 + rr + 20, C.dim, 11);
-      label(g, `${(clampF / 1000).toFixed(1)} kN`, 640 - rr - 45, 100 - ch / 2 - 22, C.amber, 14, 'center', 700);
-      // decel meter
-      const mx = 740, f = clamp(effDec / 1.2, 0, 1);
-      g.fillStyle = '#1b2733'; g.fillRect(mx - 8, 20, 16, 160);
-      g.fillStyle = effDec > 1 ? C.red : effDec >= 0.9 ? C.green : C.amber;
-      g.fillRect(mx - 8, 20 + 160 * (1 - f), 16, 160 * f);
-      g.strokeStyle = C.text; g.lineWidth = 1;
-      [0.9, 1.0].forEach(v => { const y = 20 + 160 * (1 - v / 1.2); g.beginPath(); g.moveTo(mx - 12, y); g.lineTo(mx + 12, y); g.stroke(); });
-      label(g, 'g', mx, 192, C.dim, 11);
+    const b = brakePanel(L.stageB, L.ctlB, ctx, {
+      forceLabel: 'Lever force', F: [20, 200, 5, 100], ratio: 5, servo: 0,
+      dm: [8, 14, 0.5, 11], dc: [22, 34, 1, 27], rotor: [220, 320, 10, 260],
+      pistons: 2, pistonLabel: 'Caliper pistons (2×)', calipers: 1, circuitCalipers: 1, share: 1,
+      mu: 0.45, mass: 260, tyreR: 0.36, maxTravel: 35, travelBase: 5, travelLabel: 'Lever travel', overTravel: 'hits bar!',
+      check(r, ctx) { if (r.F <= 100 && r.decel >= 0.9 && r.decel <= 1.0 && !r.bottomed) ctx.complete('brake'); }
     });
-    return () => { stop(); stopB(); };
+    return () => { a(); b(); };
   }
 };
 
@@ -738,12 +765,13 @@ const LAB_MIXTURE = {
 };
 
 /* ===================================================== LAB: IGNITION */
-const LAB_IGNITION = {
+/* cfg: { low, high (rpm targets), maxRpm, chain: [labels for the spark path] } */
+const makeIgnitionLab = cfg => ({
   title: 'Ignition Timing Lab',
   intro: 'The spark has to fire before top dead centre so that peak pressure lands about 14° after it. Find the best timing at low and high rpm.',
   tasks: [
-    { id: 'low', text: 'At <b>3,000 rpm</b>, find the timing for best power (≥ 97%)' },
-    { id: 'high', text: 'At <b>10,000 rpm</b>, find the timing for best power (≥ 97%)' },
+    { id: 'low', text: `At <b>${cfg.low.toLocaleString()} rpm</b>, find the timing for best power (≥ 97%)` },
+    { id: 'high', text: `At <b>${cfg.high.toLocaleString()} rpm</b>, find the timing for best power (≥ 97%)` },
     { id: 'knock', text: 'Over-advance the timing until the engine <b>knocks</b>' }
   ],
   mount(root, ctx) {
@@ -751,10 +779,10 @@ const LAB_IGNITION = {
       <p><b>Too early:</b> pressure spikes while the piston is still rising. It fights the engine and causes <b>knock</b> (detonation), which can crack pistons.</p>
       <p><b>Too late:</b> the piston is already running away from the pressure. Power is wasted, and the exhaust runs hot.</p>`);
     const cv = makeCanvas(L.stage, 760, 420);
-    const s = { adv: 10, rpm: 3000, pulse: 0, knockT: 0 };
+    const s = { adv: 10, rpm: cfg.low, pulse: 0, knockT: 0 };
     const ro = readouts([['pk', 'Peak pressure at'], ['pow', 'Power'], ['burn', 'Burn duration'], ['st', 'Status']]);
     L.controls.append(
-      slider('Engine speed', 2000, 12000, 500, s.rpm, v => v.toLocaleString() + ' rpm', v => s.rpm = v),
+      slider('Engine speed', 1000, cfg.maxRpm, 500, s.rpm, v => v.toLocaleString() + ' rpm', v => s.rpm = v),
       slider('Ignition advance', 0, 50, 1, s.adv, v => v + '° BTDC', v => s.adv = v),
       ro);
     const stop = animLoop(dt => {
@@ -767,8 +795,8 @@ const LAB_IGNITION = {
       ro.set('pow', Math.round(power * 100) + '%');
       ro.set('burn', burn.toFixed(0) + '° of crank');
       ro.set('st', knock ? 'KNOCKING!' : pk > 30 ? 'retarded: weak' : power > 0.97 ? 'optimal' : 'ok');
-      if (s.rpm === 3000 && power >= 0.97) ctx.complete('low');
-      if (s.rpm === 10000 && power >= 0.97) ctx.complete('high');
+      if (s.rpm === cfg.low && power >= 0.97) ctx.complete('low');
+      if (s.rpm === cfg.high && power >= 0.97) ctx.complete('high');
       if (knock) { s.knockT += dt; if (s.knockT > 0.6) ctx.complete('knock'); } else s.knockT = 0;
       s.pulse = (s.pulse + dt * Math.min(6, s.rpm / 2000)) % 1;
 
@@ -806,40 +834,42 @@ const LAB_IGNITION = {
       g.fillStyle = '#fff'; g.beginPath(); g.arc(X(pk), Y(P(pk)), 5, 0, 7); g.fill();
       if (knock) label(g, 'KNOCK! Pressure spikes before TDC and rings', X(Math.max(-40, pk)), y0 + 34, C.red, 14, 'left', 700);
       // spark chain
-      const cy = 375, steps = ['Flywheel magnets', 'Stator coil', 'ECU timing', 'Ignition coil', 'Spark plug'];
+      const cy = 375, steps = cfg.chain;
       steps.forEach((t, i) => {
-        const x = 90 + i * 145;
+        const x = 90 + i * (580 / (steps.length - 1));
         g.fillStyle = '#1b2733'; roundRect(g, x - 60, cy - 16, 120, 32, 8); g.fill();
-        const lit = Math.abs(s.pulse * 5 - i - 0.5) < 0.6;
+        const lit = Math.abs(s.pulse * steps.length - i - 0.5) < 0.6;
         g.strokeStyle = lit ? '#fde047' : C.line; g.lineWidth = 2; roundRect(g, x - 60, cy - 16, 120, 32, 8); g.stroke();
         label(g, t, x, cy, lit ? '#fde047' : C.text, 12, 'center', 600);
-        if (i < 4) { g.fillStyle = C.dim; g.beginPath(); g.moveTo(x + 64, cy - 5); g.lineTo(x + 78, cy); g.lineTo(x + 64, cy + 5); g.fill(); }
+        if (i < steps.length - 1) { g.fillStyle = C.dim; g.beginPath(); g.moveTo(x + 64, cy - 5); g.lineTo(x + 78, cy); g.lineTo(x + 64, cy + 5); g.fill(); }
       });
     });
     return stop;
   }
-};
+});
+const LAB_IGNITION = makeIgnitionLab({ low: 3000, high: 10000, maxRpm: 12000, chain: ['Flywheel magnets', 'Stator coil', 'ECU timing', 'Ignition coil', 'Spark plug'] });
 
 /* ======================================================= LAB: COOLING */
-const LAB_COOLING = {
+/* cfg: { speedLabel, explain, scenarios: [{ v, t, m: [speed, load] }],
+          survive: { v, text, short } }  (surviving 20 s in that scenario is a task) */
+const makeCoolingLab = cfg => ({
   title: 'Cooling System Lab',
   intro: 'Run the engine in different conditions and keep the coolant out of the red. Airflow, the fan, the thermostat, and the coolant level all matter.',
   tasks: [
     { id: 'thermo', text: 'Watch the <b>thermostat open</b>: warm the engine past 82 °C' },
-    { id: 'trail', text: 'Survive <b>20 seconds</b> on the <b>tight technical trail</b> without boiling over' },
+    { id: cfg.survive.v, text: cfg.survive.text },
     { id: 'low', text: 'With <b>low coolant</b>, see the engine overheat even with the fan on' }
   ],
   mount(root, ctx) {
-    const L = labLayout(root, `<p>Heat in comes from engine <b>load</b>. Heat out depends on <b>airflow</b> through the radiators (riding speed plus the fan) and on how much coolant the thermostat lets through.</p>
-      <p>The 1.1-bar cap lets coolant reach about 120 °C before it boils. With low coolant there's less to soak up heat and less flowing through the radiator.</p>`);
+    const L = labLayout(root, cfg.explain);
     const cv = makeCanvas(L.stage, 760, 380);
     const s = { speed: 0, load: 0.1, fan: false, low: false, T: 25, hist: [], flowPh: 0, trailT: 0, boiled: false, sc: 'idle', steam: [] };
     const ro = readouts([['T', 'Coolant temp'], ['th', 'Thermostat'], ['q', 'Heat from engine'], ['out', 'Heat removed']]);
-    const spSl = slider('Riding speed', 0, 100, 1, 0, v => v + ' km/h', v => { s.speed = v; s.sc = 'custom'; });
+    const spSl = slider(cfg.speedLabel, 0, cfg.maxSpeed || 100, 1, 0, v => v + ' km/h', v => { s.speed = v; s.sc = 'custom'; });
     const ldSl = slider('Engine load', 0, 100, 1, 10, v => v + '%', v => { s.load = v / 100; s.sc = 'custom'; });
     const fanT = toggle('Radiator fan', false, v => s.fan = v);
-    const sc = choice('Scenario', [{ v: 'idle', t: 'Idle warm-up' }, { v: 'fire', t: 'Fast fire road' }, { v: 'trail', t: 'Tight technical trail' }], 'idle', v => {
-      const m = { idle: [0, 10], fire: [70, 55], trail: [6, 75] }[v];
+    const sc = choice('Scenario', cfg.scenarios.map(x => ({ v: x.v, t: x.t })), cfg.scenarios[0].v, v => {
+      const m = cfg.scenarios.find(x => x.v === v).m;
       spSl.set(m[0]); ldSl.set(m[1]); s.sc = v; s.trailT = 0;
     });
     const resetBtn = el(`<button class="btn small ghost" type="button">↺ Cool down / refill</button>`);
@@ -861,7 +891,7 @@ const LAB_COOLING = {
       if (s.boiled) s.T = Math.max(Ta, s.T - 2 * sim);
       s.hist.push(s.T); if (s.hist.length > 400) s.hist.shift();
       if (s.T > 82 && open > 0.3) ctx.complete('thermo');
-      if (s.sc === 'trail' && !s.boiled) { s.trailT += dt; if (s.trailT >= 20) ctx.complete('trail'); } else if (s.boiled) s.trailT = 0;
+      if (s.sc === cfg.survive.v && !s.boiled) { s.trailT += dt; if (s.trailT >= 20) ctx.complete(cfg.survive.v); } else if (s.boiled) s.trailT = 0;
       if (s.low && s.fan && (s.T > 103 || s.boiled)) ctx.complete('low');
       ro.set('T', s.boiled ? 'BOILED OVER' : s.T.toFixed(0) + ' °C');
       ro.set('th', open < 0.02 ? 'closed' : open > 0.98 ? 'fully open' : `${Math.round(open * 100)}% open`);
@@ -923,30 +953,38 @@ const LAB_COOLING = {
       label(g, 'thermostat opens', hx + hw - 6, HY(80) + 10, C.green, 10, 'right');
       g.strokeStyle = C.amber; g.lineWidth = 2; g.beginPath();
       s.hist.forEach((v, i) => { const x = hx + i / 400 * hw; i ? g.lineTo(x, HY(v)) : g.moveTo(x, HY(v)); }); g.stroke();
-      if (s.sc === 'trail' && !s.boiled) label(g, `Trail time: ${s.trailT.toFixed(0)} / 20 s`, hx + 10, hy + 14, C.text, 12, 'left', 700);
+      if (s.sc === cfg.survive.v && !s.boiled) label(g, `${cfg.survive.short}: ${s.trailT.toFixed(0)} / 20 s`, hx + 10, hy + 14, C.text, 12, 'left', 700);
       if (s.boiled) label(g, 'BOILED OVER! Coolant is venting as steam. Cool down and refill to try again.', cv.w / 2, hy - 14, C.red, 14, 'center', 700);
     });
     return stop;
   }
-};
+});
+const LAB_COOLING = makeCoolingLab({
+  speedLabel: 'Riding speed',
+  explain: `<p>Heat in comes from engine <b>load</b>. Heat out depends on <b>airflow</b> through the radiators (riding speed plus the fan) and on how much coolant the thermostat lets through.</p>
+      <p>The 1.1-bar cap lets coolant reach about 120 °C before it boils. With low coolant there's less to soak up heat and less flowing through the radiator.</p>`,
+  scenarios: [{ v: 'idle', t: 'Idle warm-up', m: [0, 10] }, { v: 'fire', t: 'Fast fire road', m: [70, 55] }, { v: 'trail', t: 'Tight technical trail', m: [6, 75] }],
+  survive: { v: 'trail', text: 'Survive <b>20 seconds</b> on the <b>tight technical trail</b> without boiling over', short: 'Trail time' }
+});
 
 /* ==================================================== LAB: DRIVETRAIN */
-const LAB_DRIVETRAIN = {
+/* cfg: { P (Drivetrain params), explain, startText, clutchLabel, hPattern,
+          shaftLabels: [input, output], final: 'chain' | 'diff', tach: { max, band } } */
+const makeDrivetrainLab = cfg => ({
   title: 'Clutch & Gearbox Lab',
   intro: 'A see-through drivetrain on a flat road. Start the engine, use the clutch to pull away, and work up through the gears.',
   tasks: [
-    { id: 'start', text: '<b>Start</b> the engine (it only cranks in neutral or with the clutch pulled in)' },
+    { id: 'start', text: cfg.startText },
     { id: 'pull', text: 'Pull away in <b>1st gear</b> without stalling (reach 10 km/h)' },
     { id: 'third', text: 'Shift up to <b>3rd</b> and reach <b>50 km/h</b>' },
     { id: 'stall', text: '<b>Stall it on purpose</b>: stopped in 1st, let the clutch out with no throttle' }
   ],
   mount(root, ctx) {
-    const L = labLayout(root, `<p><b>Pulling away:</b> clutch in → 1st gear → add some throttle (30–40%) → slide the clutch out slowly through the <b>friction zone</b>.</p>
-      <p>Watch the plates: when they're <span style="color:#fb923c">glowing</span>, they're slipping, and the speed difference between them is turning into heat.</p>
-      <p>The gearbox pattern is <b>1–N–2–3–4–5</b>.</p>`);
+    const L = labLayout(root, cfg.explain);
     const cv = makeCanvas(L.stage, 780, 400);
-    const d = new Drivetrain();
-    const s = { th: 0, cl: 0, brake: false, a: { crank: 0, basket: 0, main: 0, counter: 0, wheel: 0 }, msg: '', msgT: 0 };
+    const BP = cfg.P, NG = BP.ratios.length;
+    const d = new Drivetrain(BP);
+    const s = { th: 0, cl: 0, brake: false, a: { crank: 0, basket: 0, counter: 0, wheel: 0 }, msg: '', msgT: 0 };
     const startBtn = el(`<button class="btn" type="button">🔑 Start</button>`);
     const killBtn = el(`<button class="btn ghost" type="button">Kill</button>`);
     const dn = el(`<button class="btn ghost" type="button">▼ Shift down</button>`);
@@ -959,11 +997,21 @@ const LAB_DRIVETRAIN = {
     ['pointerdown'].forEach(e => brk.addEventListener(e, () => s.brake = true));
     ['pointerup', 'pointerleave', 'pointercancel'].forEach(e => brk.addEventListener(e, () => s.brake = false));
     const thSl = slider('Throttle', 0, 100, 1, 0, v => v + '%', v => s.th = v / 100);
-    const clSl = slider('Clutch lever (0 = out, 100 = pulled in)', 0, 100, 1, 0, v => v + '%', v => s.cl = v / 100);
+    const clSl = slider(cfg.clutchLabel, 0, 100, 1, 0, v => v + '%', v => s.cl = v / 100);
     const ro = readouts([['rpm', 'Engine'], ['gear', 'Gear'], ['cl', 'Clutch'], ['spd', 'Road speed'], ['ov', 'Overall ratio']]);
     L.controls.append(el(`<div class="btnrow"></div>`), el(`<div class="btnrow"></div>`), thSl, clSl, ro);
     L.controls.children[0].append(startBtn, killBtn, brk);
-    L.controls.children[1].append(dn, up);
+    if (cfg.hPattern) {
+      // An H-pattern box: pick any gear directly with the lever.
+      const gl = el(`<div class="seg gearlever"></div>`);
+      BP.gearOrder.forEach(gr => {
+        const b = el(`<button type="button" class="seg-b">${gr === 0 ? 'N' : gr}</button>`);
+        b.onclick = () => d.select(gr);
+        gl.appendChild(b);
+      });
+      L.controls.children[1].append(gl);
+      ro.gl = gl;
+    } else L.controls.children[1].append(dn, up);
     let armed = false;
     const stop = animLoop(dt => {
       const sub = 10;
@@ -985,16 +1033,16 @@ const LAB_DRIVETRAIN = {
       const clState = d.gear === 0 ? 'neutral: nothing to drive' : eng <= 0 ? 'disengaged' : d.slipping ? 'SLIPPING' : 'locked';
       ro.set('rpm', Math.round(d.rpm).toLocaleString() + ' rpm' + (d.running ? '' : ' (off)'));
       ro.set('gear', d.gearLabel);
+      if (ro.gl) ro.gl.querySelectorAll('.seg-b').forEach(b => b.classList.toggle('on', b.textContent === d.gearLabel));
       ro.set('cl', clState);
       ro.set('spd', d.kmh.toFixed(1) + ' km/h');
       ro.set('ov', d.gear ? d.ratio().toFixed(1) + ' : 1' : '–');
 
       // visual angles (slowed down so you can follow them)
       const k = 0.04;
-      const wBasket = d.we / BIKE.primary;
-      const wCounter = d.gear ? d.v / BIKE.wheelR * BIKE.final : 0;
-      const wMain = d.gear ? (eng > 0 && !d.slipping ? wBasket : wCounter * BIKE.ratios[d.gear - 1]) : wBasket * (1 - clamp(s.cl, 0, 1)) * 0.6;
-      s.a.crank += d.we * k * dt; s.a.basket += wBasket * k * dt; s.a.main += wMain * k * dt; s.a.counter += wCounter * k * dt; s.a.wheel += d.v / BIKE.wheelR * k * dt;
+      const wBasket = d.we / BP.primary;
+      const wCounter = d.gear ? d.v / BP.wheelR * BP.final : 0;
+      s.a.crank += d.we * k * dt; s.a.basket += wBasket * k * dt; s.a.counter += wCounter * k * dt; s.a.wheel += d.v / BP.wheelR * k * dt;
 
       const g = cv.g; gridBg(g, cv.w, cv.h);
       const cy = 180;
@@ -1006,10 +1054,17 @@ const LAB_DRIVETRAIN = {
       g.restore();
       label(g, 'CRANKSHAFT', 70, cy - 66, C.text, 11, 'center', 700);
       label(g, Math.round(d.rpm) + ' rpm', 70, cy + 64, d.limiting ? C.red : C.amber, 12, 'center', 700);
-      // primary gears
-      drawGear(g, 128, cy - 34, 18, 16, s.a.crank, '#9aa4ae');
-      drawGear(g, 190, cy - 34, 46, 40, -s.a.basket, '#c9a53a');
-      label(g, 'primary drive 3:1', 160, cy - 96, C.dim, 10);
+      if (BP.primary > 1) {
+        drawGear(g, 128, cy - 34, 18, 16, s.a.crank, '#9aa4ae');
+        drawGear(g, 190, cy - 34, 46, 40, -s.a.basket, '#c9a53a');
+        label(g, `primary drive ${BP.primary}:1`, 160, cy - 96, C.dim, 10);
+      } else {
+        // Car: the flywheel bolts to the crank and the clutch clamps against it.
+        g.strokeStyle = '#94a3b8'; g.lineWidth = 8; g.beginPath(); g.moveTo(118, cy); g.lineTo(250, cy); g.stroke();
+        g.beginPath(); g.arc(178, cy, 52, 0, 7); g.fillStyle = '#4b5563'; g.fill();
+        g.save(); g.translate(178, cy); g.rotate(s.a.crank); g.fillStyle = '#9aa4ae'; g.fillRect(-4, -52, 8, 18); g.restore();
+        label(g, 'FLYWHEEL', 178, cy - 66, C.text, 11, 'center', 700);
+      }
       // clutch pack
       const px = 250, gap = 3 + clamp(s.cl, 0, 1) * 6, plates = 7;
       const slipGlow = d.slipping && d.gear ? clamp(Math.abs(d.clutchTorque) / 60, 0.2, 1) : 0;
@@ -1024,49 +1079,67 @@ const LAB_DRIVETRAIN = {
       label(g, 'CLUTCH', px + pw / 2, cy - 82, C.text, 11, 'center', 700);
       label(g, 'friction', px + pw / 2, cy + 80, '#c08457', 10);
       label(g, '+ steel plates', px + pw / 2, cy + 93, '#c0c7cf', 10);
-      label(g, s.cl > 0.85 ? 'lever IN: plates apart' : s.cl > 0.15 ? 'friction zone' : 'springs clamp plates', px + pw / 2, cy + 112, C.dim, 10);
+      label(g, s.cl > 0.85 ? 'clutch IN: plates apart' : s.cl > 0.15 ? 'friction zone' : 'springs clamp plates', px + pw / 2, cy + 112, C.dim, 10);
       // gearbox
-      const gx0 = 370, mainY = cy - 50, cntY = cy + 50, spacing = 52;
-      g.fillStyle = '#1b2430'; roundRect(g, gx0 - 20, cy - 120, 5 * spacing + 30, 240, 10); g.fill();
+      const gx0 = 370, mainY = cy - 50, cntY = cy + 50, spacing = 260 / NG;
+      g.fillStyle = '#1b2430'; roundRect(g, gx0 - 20, cy - 120, NG * spacing + 30, 240, 10); g.fill();
       g.strokeStyle = '#94a3b8'; g.lineWidth = 6;
-      g.beginPath(); g.moveTo(px + pw + 6, mainY); g.lineTo(gx0 + 5 * spacing, mainY); g.stroke();
-      g.beginPath(); g.moveTo(gx0 - 10, cntY); g.lineTo(gx0 + 5 * spacing + 70, cntY); g.stroke();
-      label(g, 'mainshaft (from clutch)', gx0 + 5 * spacing + 6, mainY - 12, C.dim, 10, 'right');
-      label(g, 'countershaft (output)', gx0 + 5 * spacing + 6, cntY + 82, C.dim, 10, 'right');
-      BIKE.ratios.forEach((R, i) => {
-        const x = gx0 + 10 + i * spacing, cd = 100;
+      g.beginPath(); g.moveTo(px + pw + 6, mainY); g.lineTo(gx0 + NG * spacing, mainY); g.stroke();
+      g.beginPath(); g.moveTo(gx0 - 10, cntY); g.lineTo(gx0 + NG * spacing + 70, cntY); g.stroke();
+      label(g, cfg.shaftLabels[0], gx0 - 14, cy + 132, C.dim, 10, 'left');
+      label(g, cfg.shaftLabels[1], gx0 + NG * spacing + 6, cy + 132, C.dim, 10, 'right');
+      BP.ratios.forEach((R, i) => {
+        const x = gx0 + 10 + i * spacing, cd = 100 * Math.min(1, 4.6 / (1 + BP.ratios[0])), gw = Math.min(20, spacing - 10);
         const rm = cd / (1 + R), rc = cd * R / (1 + R);
         const on = d.gear === i + 1;
         g.fillStyle = on ? C.amber : '#4b5563';
-        roundRect(g, x, mainY - rm * 0.92, 20, rm * 1.84, 3); g.fill();
-        roundRect(g, x, cntY - rc * 0.92, 20, rc * 1.84, 3); g.fill();
-        if (on) { g.fillStyle = C.teal; g.fillRect(x + 21, cntY - 14, 6, 28); }
-        label(g, String(i + 1), x + 10, cy - 104, on ? C.amber : C.dim, 13, 'center', 700);
-        label(g, R.toFixed(2), x + 10, cy + 110, on ? C.amber : C.dim, 10);
+        roundRect(g, x, mainY - rm * 0.92, gw, rm * 1.84, 3); g.fill();
+        roundRect(g, x, cntY - rc * 0.92, gw, rc * 1.84, 3); g.fill();
+        if (on) { g.fillStyle = C.teal; g.fillRect(x + gw + 1, cntY - 14, 5, 28); }
+        label(g, String(i + 1), x + gw / 2, cy - 104, on ? C.amber : C.dim, 13, 'center', 700);
+        label(g, R.toFixed(2), x + gw / 2, cy + 110, on ? C.amber : C.dim, 10);
       });
-      label(g, 'GEARBOX (all pairs always meshed; the dog ring locks one)', gx0 + 5 * spacing / 2, cy - 134, C.text, 11, 'center', 700);
-      // sprocket + chain + wheel
-      const sx = gx0 + 5 * spacing + 70, wx = 700;
-      drawGear(g, sx, cntY, 14, 13, s.a.counter, '#9aa4ae');
-      g.strokeStyle = '#6b7280'; g.lineWidth = 3; g.setLineDash([5, 3]); g.lineDashOffset = -s.a.counter * 14;
-      g.beginPath(); g.moveTo(sx, cntY - 14); g.lineTo(wx, cntY - 44); g.stroke();
-      g.beginPath(); g.moveTo(wx, cntY + 44); g.lineTo(sx, cntY + 14); g.stroke(); g.setLineDash([]);
+      label(g, 'GEARBOX (all pairs always meshed; the dog ring locks one)', gx0 + NG * spacing / 2, cy - 134, C.text, 11, 'center', 700);
+      const sx = gx0 + NG * spacing + 70, wx = 700;
       g.beginPath(); g.arc(wx, cntY, 70, 0, 7); g.strokeStyle = '#17191c'; g.lineWidth = 14; g.stroke();
-      drawGear(g, wx, cntY, 42, 48, s.a.wheel, COL.orange);
+      if (cfg.final === 'chain') {
+        drawGear(g, sx, cntY, 14, 13, s.a.counter, '#9aa4ae');
+        g.strokeStyle = '#6b7280'; g.lineWidth = 3; g.setLineDash([5, 3]); g.lineDashOffset = -s.a.counter * 14;
+        g.beginPath(); g.moveTo(sx, cntY - 14); g.lineTo(wx, cntY - 44); g.stroke();
+        g.beginPath(); g.moveTo(wx, cntY + 44); g.lineTo(sx, cntY + 14); g.stroke(); g.setLineDash([]);
+        drawGear(g, wx, cntY, 42, 48, s.a.wheel, COL.orange);
+        label(g, `final drive ${BP.rearTeeth}/${BP.frontTeeth}`, (sx + wx) / 2, cntY + 64, C.dim, 10);
+      } else {
+        // Propshaft to the differential's pinion, which turns the ring gear.
+        g.strokeStyle = '#94a3b8'; g.lineWidth = 8; g.beginPath(); g.moveTo(sx - 70, cntY); g.lineTo(wx - 50, cntY); g.stroke();
+        for (let i = 0; i < 4; i++) { const ph = ((s.a.counter * 0.5 + i / 4) % 1); g.fillStyle = '#e2e8f0'; g.fillRect(sx - 70 + ph * (wx - 50 - sx + 70), cntY - 5, 3, 10); }
+        drawGear(g, wx - 42, cntY, 10, 9, s.a.counter, '#9aa4ae');
+        drawGear(g, wx, cntY, 34, 37, s.a.wheel, COL.orange);
+        label(g, 'propshaft', (sx + wx) / 2 - 30, cntY - 14, C.dim, 10);
+        label(g, `diff: ring & pinion ${BP.final}:1`, (sx + wx) / 2, cntY + 64, C.dim, 10);
+      }
       label(g, 'REAR WHEEL', wx, cntY - 92, C.text, 11, 'center', 700);
       label(g, d.kmh.toFixed(0) + ' km/h', wx, cntY + 92, C.amber, 14, 'center', 700);
-      label(g, `final drive ${BIKE.rearTeeth}/${BIKE.frontTeeth}`, (sx + wx) / 2, cntY + 64, C.dim, 10);
       // tach bar
-      const tx = 30, ty = 360, tw = 720;
+      const tx = 30, ty = 360, tw = 720, TM = cfg.tach.max, [blo, bhi] = cfg.tach.band;
       g.fillStyle = '#1b2733'; roundRect(g, tx, ty, tw, 14, 7); g.fill();
-      const rf = clamp(d.rpm / 13000, 0, 1);
-      g.fillStyle = d.rpm > 11000 ? C.red : d.rpm > 6000 ? C.green : C.amber; roundRect(g, tx, ty, tw * rf, 14, 7); g.fill();
-      g.fillStyle = 'rgba(74,222,128,.25)'; g.fillRect(tx + tw * 6000 / 13000, ty - 4, tw * 5000 / 13000, 4);
-      label(g, 'power band', tx + tw * 8500 / 13000, ty - 12, C.green, 10);
+      const rf = clamp(d.rpm / TM, 0, 1);
+      g.fillStyle = d.rpm > BP.limiter - 1000 ? C.red : d.rpm > blo ? C.green : C.amber; roundRect(g, tx, ty, tw * rf, 14, 7); g.fill();
+      g.fillStyle = 'rgba(74,222,128,.25)'; g.fillRect(tx + tw * blo / TM, ty - 4, tw * (bhi - blo) / TM, 4);
+      label(g, 'power band', tx + tw * (blo + bhi) / 2 / TM, ty - 12, C.green, 10);
       if (s.msgT > 0) { g.fillStyle = 'rgba(10,16,24,.92)'; roundRect(g, 20, 8, cv.w - 40, 30, 8); g.fill(); label(g, s.msg, cv.w / 2, 23, s.msgC, 13, 'center', 700); }
     });
     return stop;
   }
-};
+});
+const LAB_DRIVETRAIN = makeDrivetrainLab({
+  P: BIKE, final: 'chain', hPattern: false, tach: { max: 13000, band: [6000, 11000] },
+  startText: '<b>Start</b> the engine (it only cranks in neutral or with the clutch pulled in)',
+  clutchLabel: 'Clutch lever (0 = out, 100 = pulled in)',
+  shaftLabels: ['mainshaft (from clutch)', 'countershaft (output)'],
+  explain: `<p><b>Pulling away:</b> clutch in → 1st gear → add some throttle (30–40%) → slide the clutch out slowly through the <b>friction zone</b>.</p>
+      <p>Watch the plates: when they're <span style="color:#fb923c">glowing</span>, they're slipping, and the speed difference between them is turning into heat.</p>
+      <p>The gearbox pattern is <b>1–N–2–3–4–5</b>.</p>`
+});
 
-const LABS = { gears: LAB_GEARS, chassis: LAB_CHASSIS, fourstroke: LAB_FOURSTROKE, mixture: LAB_MIXTURE, ignition: LAB_IGNITION, cooling: LAB_COOLING, drivetrain: LAB_DRIVETRAIN };
+var LABS = { gears: LAB_GEARS, chassis: LAB_CHASSIS, fourstroke: LAB_FOURSTROKE, mixture: LAB_MIXTURE, ignition: LAB_IGNITION, cooling: LAB_COOLING, drivetrain: LAB_DRIVETRAIN };

@@ -288,3 +288,11 @@ svg.scene.placing .zone circle { fill: rgba(245, 165, 36, .18); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
 }
+
+/* links between the two games, and small extras */
+.other-game { margin-top: 1.4em; color: var(--dim); }
+.other-game a { color: var(--teal); font-weight: 600; }
+.penalties { text-align: left; color: var(--red); font-size: .92rem; margin: 0 auto 1em; max-width: 420px; }
+.quizlet { margin-top: 1em; padding-top: .8em; border-top: 1px solid var(--line); }
+.quizlet .seg { margin: .5em 0; }
+.gearlever .seg-b { min-width: 2.6em; }

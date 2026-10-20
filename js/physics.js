@@ -15,19 +15,41 @@ const BIKE = {
   Tmax: 30,            // peak combustion torque, Nm
   clutchCap: 90,       // clutch torque capacity fully engaged, Nm
   idle: 2000, limiter: 12000, stallRpm: 900,
+  peakRpm: 8500, fallRpm: 4000,
+  idleGain: 0.01, idleMax: 5, fricScale: 1, startRpm: 1500,
   CdA: 0.6, brakeMax: 1.0 * 185 * 9.81,
-  heatK: 0.0011
+  heatK: 0.0011,
+  gearOrder: [1, 0, 2, 3, 4, 5],   // 1-N-2-3-4-5, in shift order
+  startPos: 1,
+  clutchWord: 'Pull the clutch in'
 };
 BIKE.final = BIKE.rearTeeth / BIKE.frontTeeth;
 
-/* Normalised torque curve: soft at low rpm, peak ~8500, falling to the limiter. */
-function torqueCurve(rpm) {
-  if (rpm <= 8500) return 0.4 + 0.6 * Math.sin(clamp(rpm / 8500, 0, 1) * Math.PI / 2);
-  return Math.max(0, 1 - Math.pow((rpm - 8500) / 4000, 2) * 0.4);
-}
+/* A front-engined, rear-drive roadster with a six-speed H-pattern gearbox. */
+const CAR = {
+  primary: 1.0,
+  ratios: [3.71, 2.27, 1.65, 1.26, 1.0, 0.84],
+  final: 4.1,
+  wheelR: 0.30,
+  mass: 1150,
+  Ie: 0.25,
+  Tmax: 185,
+  clutchCap: 320,
+  idle: 1000, limiter: 7200, stallRpm: 400,
+  peakRpm: 4800, fallRpm: 2800,
+  idleGain: 0.1, idleMax: 30, fricScale: 6, startRpm: 900,
+  CdA: 0.65, brakeMax: 0.95 * 1150 * 9.81,
+  heatK: 0.0004,
+  gearOrder: [0, 1, 2, 3, 4, 5, 6],
+  startPos: 0,
+  clutchWord: 'Press the clutch pedal'
+};
 
-// Gear positions in shift order. Index into this with `pos`.
-const GEAR_ORDER = [1, 0, 2, 3, 4, 5]; // 1-N-2-3-4-5
+/* Normalised torque curve: soft at low rpm, peak at peakRpm, falling to the limiter. */
+function torqueCurve(rpm, P = BIKE) {
+  if (rpm <= P.peakRpm) return 0.4 + 0.6 * Math.sin(clamp(rpm / P.peakRpm, 0, 1) * Math.PI / 2);
+  return Math.max(0, 1 - Math.pow((rpm - P.peakRpm) / P.fallRpm, 2) * 0.4);
+}
 
 class Drivetrain {
   constructor(params = {}) {
@@ -35,20 +57,26 @@ class Drivetrain {
     this.reset();
   }
   reset() {
-    this.we = 0; this.v = 0; this.pos = 1; this.running = false;
+    this.we = 0; this.v = 0; this.pos = this.P.startPos; this.running = false;
     this.clutchHeat = 0; this.stalls = 0; this.limiting = false; this.slipping = false;
     this.wheelAngle = 0; this.crankAngle = 0; this.events = [];
     this.clutchTorque = 0; this.engineTorque = 0; this.locked = false;
   }
-  get gear() { return GEAR_ORDER[this.pos]; }
+  get gear() { return this.P.gearOrder[this.pos]; }
   get gearLabel() { return this.gear === 0 ? 'N' : String(this.gear); }
   get rpm() { return this.we * RAD2RPM; }
   get kmh() { return this.v * 3.6; }
   ratio(g = this.gear) { return g === 0 ? 0 : this.P.primary * this.P.ratios[g - 1] * this.P.final; }
 
   shift(dir) {
-    const np = clamp(this.pos + dir, 0, GEAR_ORDER.length - 1);
+    const np = clamp(this.pos + dir, 0, this.P.gearOrder.length - 1);
     if (np === this.pos) return false;
+    this.pos = np;
+    return true;
+  }
+  select(g) {
+    const np = this.P.gearOrder.indexOf(g);
+    if (np < 0 || np === this.pos) return false;
     this.pos = np;
     return true;
   }
@@ -57,11 +85,11 @@ class Drivetrain {
   start(clutch) {
     if (this.running) return false;
     if (this.gear !== 0 && clutch < 0.8) {
-      this.emit('warn', 'Starter blocked: you\'re in gear with the clutch out. Pull the clutch in or find neutral.');
+      this.emit('warn', `Starter blocked: you're in gear with the clutch out. ${this.P.clutchWord} or find neutral.`);
       return false;
     }
     this.running = true;
-    this.we = Math.max(this.we, 1500 / RAD2RPM);
+    this.we = Math.max(this.we, this.P.startRpm / RAD2RPM);
     this.emit('info', 'Engine started.');
     return true;
   }
@@ -79,11 +107,11 @@ class Drivetrain {
     if (this.running) {
       // Progressive throttle feel, and an idle circuit that holds ~idle rpm.
       const th = 1 - Math.pow(1 - clamp(inp.throttle || 0, 0, 1), 2);
-      let comb = th * P.Tmax * torqueCurve(rpm) + clamp((P.idle - rpm) * 0.01, 0, 5);
+      let comb = th * P.Tmax * torqueCurve(rpm, P) + clamp((P.idle - rpm) * P.idleGain, 0, P.idleMax);
       if (rpm > P.limiter) { comb = 0; this.limiting = true; }
-      Te = comb - (1.2 + rpm * 0.0003 + (1 - th) * rpm * 0.0012);
+      Te = comb - P.fricScale * (1.2 + rpm * 0.0003 + (1 - th) * rpm * 0.0012);
     } else {
-      Te = this.we > 0.01 ? -(4 + rpm * 0.0006) : 0;
+      Te = this.we > 0.01 ? -P.fricScale * (4 + rpm * 0.0006) : 0;
     }
     this.engineTorque = Te;
 
@@ -150,7 +178,7 @@ class Drivetrain {
 
     if (this.running && this.rpm < P.stallRpm) {
       this.running = false; this.stalls++;
-      this.emit('stall', 'Stalled! The engine was dragged below idle. Pull the clutch in, then press start.');
+      this.emit('stall', `Stalled! The engine was dragged below idle. ${P.clutchWord}, then press start.`);
     }
 
     this.wheelAngle += this.v / R * dt;

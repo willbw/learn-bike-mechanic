@@ -1,6 +1,6 @@
 /* Screens, build mechanic, quizzes and progress. */
 
-const STORE_KEY = 'pedals-to-pistons-v1';
+const STORE_KEY = GAME.storeKey;
 const store = {
   load() { try { return JSON.parse(localStorage.getItem(STORE_KEY)) || {}; } catch (e) { return {}; } },
   save(v) { try { localStorage.setItem(STORE_KEY, JSON.stringify(v)); } catch (e) { /* private mode */ } }
@@ -55,19 +55,17 @@ function fitThumbs(root) {
   });
 }
 
+// Earlier chapters drawn on the same scene count as fitted.
 function installedSet(ch) {
   const set = new Set();
-  if (ch.scene === 'dirtbike') {
-    CHAPTERS.forEach(c => { if (c.scene === 'dirtbike' && c.num < ch.num) c.parts.forEach(p => set.add(p)); });
-  }
+  CHAPTERS.forEach(c => { if (c.scene === ch.scene && c.num < ch.num) c.parts.forEach(p => set.add(p)); });
   prog(ch.id).built.forEach(p => set.add(p));
   return set;
 }
-function sceneIds(scene) { return scene === 'bicycle' ? CHAPTERS[0].parts : DIRT_PARTS; }
-const VIEWBOX = '70 50 860 490';
+const sceneIds = scene => CHAPTERS.filter(c => c.scene === scene).flatMap(c => c.parts);
 
 function sceneSVG(scene, installed, extra = '') {
-  return `<svg class="scene" viewBox="${VIEWBOX}" role="img" aria-label="${scene} blueprint">
+  return `<svg class="scene" viewBox="${GAME.scenes[scene].viewBox}" role="img" aria-label="${scene} blueprint">
     ${SCENE_DEFS}
     <g class="parts">${sceneLayers(sceneIds(scene), { classFor: id => installed.has(id) ? 'on' : '' })}</g>
     ${extra}
@@ -85,24 +83,20 @@ function showPart(id, onClose) { modal(partCard(id), { cls: 'card', onClose }); 
 /* --------------------------------------------------------------- HOME */
 function renderHome() {
   const any = Object.keys(state.progress).length > 0;
-  const all = new Set(DIRT_PARTS);
+  const all = new Set(sceneIds(GAME.heroScene));
   setScreen(`
     <section class="home">
-      <div class="home-art">${sceneSVG('dirtbike', all)}</div>
+      <div class="home-art">${sceneSVG(GAME.heroScene, all)}</div>
       <div class="home-copy">
         <div class="eyebrow">A hands-on workshop game</div>
-        <h1>Pedals <span>to</span> Pistons</h1>
-        <p class="lead">Learn how a motorcycle really works by building one. Start with a bicycle. Then, part by part, turn it into a four-stroke dirt bike: suspension, engine, fuel, spark, cooling, clutch, and gearbox. Then ride it.</p>
-        <ul class="home-points">
-          <li><b>9 chapters</b>, each adding one system</li>
-          <li><b>40+ parts</b>, each with a workshop card explaining how it works</li>
-          <li><b>7 interactive labs</b>: gears, suspension, a four-stroke engine, carb jetting, ignition timing, cooling, clutch</li>
-          <li>A <b>physics-based ride</b> where you can stall, lug, and slip the clutch for real</li>
-        </ul>
+        <h1>${GAME.titleHTML}</h1>
+        <p class="lead">${GAME.lead}</p>
+        <ul class="home-points">${GAME.points.map(p => `<li>${p}</li>`).join('')}</ul>
         <div class="btnrow">
           <button class="btn big" id="go">${any ? 'Continue' : 'Start building'} →</button>
           ${any ? '<button class="btn ghost" id="reset">Reset progress</button>' : ''}
         </div>
+        ${GAME.other ? `<p class="other-game">${GAME.other.text} <a href="${GAME.other.href}">${GAME.other.label} →</a></p>` : ''}
       </div>
     </section>`);
   document.getElementById('go').onclick = renderMap;
@@ -117,10 +111,13 @@ function renderHome() {
 /* ---------------------------------------------------------------- MAP */
 function renderMap() {
   const doneCount = CHAPTERS.filter(c => isDone(c.id)).length;
-  const showScene = isDone('ch1') ? 'dirtbike' : 'bicycle';
-  const inst = showScene === 'bicycle' ? new Set(prog('ch1').built) : (() => { const s = new Set(); CHAPTERS.forEach(c => { if (c.scene === 'dirtbike' && isDone(c.id)) c.parts.forEach(p => s.add(p)); }); return s; })();
+  // Show the machine as it stands: the scene of the first unfinished chapter.
+  const cur = CHAPTERS.find(c => !isDone(c.id)) || CHAPTERS[CHAPTERS.length - 1];
+  const showScene = cur.scene;
+  const inst = new Set(prog(cur.id).built);
+  CHAPTERS.forEach(c => { if (c.scene === showScene && isDone(c.id)) c.parts.forEach(p => inst.add(p)); });
   setScreen(`
-    <header class="topbar"><button class="link" id="home">← Pedals to Pistons</button><div class="pill">${doneCount} / ${CHAPTERS.length} chapters</div></header>
+    <header class="topbar"><button class="link" id="home">← ${GAME.title}</button><div class="pill">${doneCount} / ${CHAPTERS.length} chapters</div></header>
     <section class="map">
       <div class="map-hero">
         <div class="map-art">${sceneSVG(showScene, inst)}</div>
@@ -135,7 +132,7 @@ function renderMap() {
           return `<button class="chap ${un ? '' : 'locked'} ${dn ? 'done' : ''}" data-i="${i}" ${un ? '' : 'disabled'}>
             <div class="chap-num">${dn ? '✓' : c.num}</div>
             <div class="chap-text"><h3>${c.title}</h3><p>${c.subtitle}</p>
-            <div class="chap-meta">${c.ride ? 'Ride' : `${c.parts.length} parts${c.lab ? ' · lab' : ''} · quiz`}${!dn && started ? ' · <i>in progress</i>' : ''}${un ? '' : ' · 🔒 locked'}</div></div>
+            <div class="chap-meta">${c.ride ? GAME.ride.verb : `${c.parts.length} parts${c.lab ? ' · lab' : ''} · quiz`}${!dn && started ? ' · <i>in progress</i>' : ''}${un ? '' : ' · 🔒 locked'}</div></div>
           </button>`;
         }).join('')}
       </div>
@@ -167,7 +164,7 @@ function defaultStep(ch) {
   if (ch.lab && !p.lab) return 'lab';
   return st[st.length - 1];
 }
-const STEP_LABEL = { brief: 'Briefing', build: 'Build', lab: 'Lab', quiz: 'Quiz', ride: 'Ride' };
+const STEP_LABEL = { brief: 'Briefing', build: 'Build', lab: 'Lab', quiz: 'Quiz', ride: GAME.ride.verb };
 
 function openChapter(id, step) {
   const ch = CHAPTER_BY_ID[id];
@@ -190,7 +187,7 @@ function renderBrief(ch, body) {
       <div class="eyebrow">Chapter ${ch.num} · ${ch.subtitle}</div>
       <h1>${ch.title}</h1>
       ${ch.brief}
-      <div class="btnrow"><button class="btn big" id="next">${ch.ride ? 'Ride it →' : 'Start building →'}</button></div>
+      <div class="btnrow"><button class="btn big" id="next">${ch.ride ? GAME.ride.verb + ' it →' : 'Start building →'}</button></div>
     </article>`;
   document.getElementById('next').onclick = () => { prog(ch.id).briefed = true; save(); openChapter(ch.id, ch.ride ? 'ride' : 'build'); };
 }
@@ -368,7 +365,7 @@ function renderLab(ch, body) {
   const cont = body.querySelector('#cont');
   const ctx = {
     complete(tid) {
-      if (done.has(tid)) return;
+      if (done.has(tid) || !lab.tasks.some(t => t.id === tid)) return;
       done.add(tid); p.labTasks = [...done]; save();
       const li = body.querySelector(`[data-t="${tid}"]`); if (li) { li.classList.add('ok', 'flash'); }
       const t = lab.tasks.find(x => x.id === tid);
@@ -428,29 +425,32 @@ function renderQuiz(ch, body) {
 /* --------------------------------------------------------------- RIDE */
 function renderRide(ch, body) {
   body.innerHTML = `<div id="ride-root"></div>`;
-  cleanup = mountRide(body.querySelector('#ride-root'), {
+  const R = GAME.ride;
+  cleanup = mountRide(body.querySelector('#ride-root'), Object.assign({}, R, {
     onFinish(r) {
-      const medal = r.stalls === 0 && r.time <= 55 ? 'gold' : r.stalls <= 2 && r.time <= 90 ? 'silver' : 'bronze';
+      const clean = r.stalls === 0 && !r.penalties.length;
+      const medal = clean && r.time <= R.gold ? 'gold' : r.stalls <= 2 && r.time <= R.silver ? 'silver' : 'bronze';
       const p = prog(ch.id); p.done = true;
       p.best = p.best && p.best.time < r.time ? p.best : r; save();
       modal(`<div class="cert ${medal}">
         <div class="medal">${{ gold: '🥇', silver: '🥈', bronze: '🥉' }[medal]}</div>
         <div class="eyebrow">Certificate of completion</div>
-        <h1>Dirt-bike mechanic</h1>
-        <p class="lead">You built a dirt bike from a bicycle up, learned what every part does, and rode it across the test track.</p>
+        <h1>${R.certTitle}</h1>
+        <p class="lead">${R.certText}</p>
         <div class="stats">
           <div><b>${r.time.toFixed(1)} s</b><span>time</span></div>
           <div><b>${r.stalls}</b><span>stalls</span></div>
-          <div><b>${r.limiter.toFixed(1)} s</b><span>on the limiter</span></div>
+          ${R.track.rules ? `<div><b>${r.penalties.length}</b><span>penalties</span></div>` : `<div><b>${r.limiter.toFixed(1)} s</b><span>on the limiter</span></div>`}
           <div><b>${r.box ? 'Yes!' : 'No'}</b><span>stopped in the box</span></div>
         </div>
-        <p class="small">${medal === 'gold' ? 'Gold: clean and quick, a real rider.' : 'For gold: finish under 55 s with zero stalls. Tip: shift down before the climbs, and keep some throttle on as the clutch comes out.'}</p>
-        <div class="modal-foot"><button class="btn ghost" id="again">Ride again</button><button class="btn" id="home2">Back to workshop</button></div>
+        ${r.penalties.length ? `<ul class="penalties">${r.penalties.map(x => `<li>${x}</li>`).join('')}</ul>` : ''}
+        <p class="small">${medal === 'gold' ? R.goldText : `For gold: finish under ${R.gold} s with zero stalls${R.track.rules ? ' and no penalties' : ''}. ${R.tip}`}</p>
+        <div class="modal-foot"><button class="btn ghost" id="again">${R.verb} again</button><button class="btn" id="home2">Back to workshop</button></div>
       </div>`, { dismissable: false });
       document.getElementById('again').onclick = () => openChapter(ch.id, 'ride');
       document.getElementById('home2').onclick = renderMap;
     }
-  });
+  }));
 }
 
 renderHome();
